@@ -21,11 +21,15 @@ EDITION=""          # "ce" or "ee"
 UPGRADE_PATH=""     # raw path string
 CONTAINER_NAME="gitlab"
 COMPOSE_FILE="compose.yaml"
+AUTOMATIC=false     # auto-detect upgrade path from GitLab + Docker Hub
+ASSUME_YES=false    # skip confirmation prompts
 HEALTH_CHECK_INTERVAL=5         # seconds between health polls
 HEALTH_CHECK_TIMEOUT=600        # max seconds to wait for healthy (10 min)
 MIGRATION_CHECK_INTERVAL=10     # seconds between migration status polls
 MIGRATION_TIMEOUT_NORMAL=600    # max seconds for normal upgrade migrations (10 min)
 MIGRATION_TIMEOUT_MAJOR=1800    # max seconds for major-version migrations (30 min)
+UPGRADE_API_URL="https://gitlab.com/api/v4/projects/gitlab-org%2Fgitlab/repository/files/config%2Fupgrade_path.yml/raw?ref=master"
+DOCKER_HUB_API="https://hub.docker.com/v2/repositories/gitlab"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
@@ -144,114 +148,16 @@ wait_for_background_migrations() {
     return 0  # Don't abort, just warn
 }
 
-# ── Argument parsing ─────────────────────────────────────────────────────────
-usage() {
-    cat <<'EOF'
-Usage:
-  gitlab-upgrade.sh --community --path "18.11.2 => 18.11.4 => 19.0.1"
-  gitlab-upgrade.sh --enterprise --path "18.11.2 => 18.11.4 => 19.0.1"
-  gitlab-upgrade.sh --community --path "18.11.2 => 19.0.1" --container-name my-gitlab
-
-Options:
-  --community        GitLab Community Edition (ce)
-  --enterprise       GitLab Enterprise Edition (ee)
-  --path "A => B => C"  Upgrade path (current => intermediates => target)
-  --container-name N     Container name (default: gitlab)
-  --compose-file F       Compose file (default: compose.yaml)
-EOF
-    exit 1
-}
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --community)
-            [ -n "$EDITION" ] && die "Cannot specify both --community and --enterprise"
-            EDITION="ce"
-            shift
-            ;;
-        --enterprise)
-            [ -n "$EDITION" ] && die "Cannot specify both --community and --enterprise"
-            EDITION="ee"
-            shift
-            ;;
-        --path)
-            [ $# -lt 2 ] && die "--path requires an argument"
-            UPGRADE_PATH="$2"
-            shift 2
-            ;;
-        --container-name)
-            [ $# -lt 2 ] && die "--container-name requires an argument"
-            CONTAINER_NAME="$2"
-            shift 2
-            ;;
-        --compose-file)
-            [ $# -lt 2 ] && die "--compose-file requires an argument"
-            COMPOSE_FILE="$2"
-            shift 2
-            ;;
-        --help|-h)
-            usage
-            ;;
-        *)
-            die "Unknown option: $1"
-            ;;
-    esac
-done
-
-# ── Validate required arguments ──────────────────────────────────────────────
-[ -z "$EDITION" ] && die "Must specify --community or --enterprise"
-[ -z "$UPGRADE_PATH" ] && die "Must specify --path"
-
-# ── Parse the upgrade path ───────────────────────────────────────────────────
-# Split on " => " separator, trim whitespace, collect into array
-versions=()
-remaining="$UPGRADE_PATH"
-while [[ "$remaining" =~ ^[[:space:]]*([^[:space:]]+) ]]; do
-    versions+=("${BASH_REMATCH[1]}")
-    remaining="${remaining#*${BASH_REMATCH[1]}}"
-    # Remove " => " separator if present
-    remaining="${remaining#*=>}"
-done
-
-[ "${#versions[@]}" -lt 2 ] && die "Upgrade path must contain at least two versions (current => target)"
-
-CURRENT_VERSION="${versions[0]}"
-TARGET_VERSIONS=("${versions[@]:1}")
-
-log_info "Edition:          GitLab ${EDITION^^}"
-log_info "Container name:   ${CONTAINER_NAME}"
-log_info "Compose file:     ${COMPOSE_FILE}"
-log_info "Current version:  ${CURRENT_VERSION}"
-log_info "Upgrade path:     ${CURRENT_VERSION} => $(IFS=' => '; echo "${TARGET_VERSIONS[*]}")"
-echo ""
-
-# ── Validate compose.yaml exists ─────────────────────────────────────────────
-if [ ! -f "$COMPOSE_FILE" ]; then
-    # Also check docker-compose.yaml as a fallback
-    if [ -f "docker-compose.yaml" ]; then
-        COMPOSE_FILE="docker-compose.yaml"
-        log_warn "compose.yaml not found, using docker-compose.yaml"
-    elif [ -f "docker-compose.yml" ]; then
-        COMPOSE_FILE="docker-compose.yml"
-        log_warn "compose.yaml not found, using docker-compose.yml"
-    else
-        die "No compose file found (tried compose.yaml, docker-compose.yaml, docker-compose.yml)"
-    fi
-fi
-
-# ── Validate current version ─────────────────────────────────────────────────
-log_step "Validating current GitLab version..."
-
 # Check if a string looks like a semver version (not a sha256 hash)
 looks_like_version() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+ ]]
 }
 
-# Method 1: Try gitlab-rake gitlab:env:info (most reliable)
+# Detect the running GitLab version using multiple methods
 get_current_version() {
     local version=""
 
-    # Try the rake method — capture the Version line under "GitLab information"
+    # Method 1: Try gitlab-rake gitlab:env:info (most reliable)
     # Use a timeout since this can be slow on first run or during upgrades
     version=$(timeout 30 docker exec "$CONTAINER_NAME" gitlab-rake gitlab:env:info 2>/dev/null \
         | sed -n '/GitLab information/,/^$/p' \
@@ -294,16 +200,344 @@ get_current_version() {
     return 1
 }
 
-RUNNING_VERSION=$(get_current_version) || true
+# ── Automatic upgrade path detection ─────────────────────────────────────────
+# Fetches the canonical upgrade_path.yml from GitLab's repo and resolves each
+# major.minor stop to the latest available Docker image tag.
 
-if [ -n "$RUNNING_VERSION" ]; then
-    if [ "$RUNNING_VERSION" != "$CURRENT_VERSION" ]; then
-        die "Version mismatch: expected ${CURRENT_VERSION} but running ${RUNNING_VERSION}"
+# Fetch and parse upgrade_path.yml from GitLab API
+# Outputs lines like "18.11" "19.2" etc.
+fetch_upgrade_stops() {
+    local yaml
+    yaml=$(curl -sfL --max-time 15 "$UPGRADE_API_URL") || {
+        log_warn "Failed to fetch upgrade_path.yml from GitLab API"
+        return 1
+    }
+
+    # Parse YAML: extract major.minor pairs
+    echo "$yaml" | awk '
+        /^- major:/ { major = $3 }
+        /minor:/    { printf "%s.%s\n", major, $2 }
+    '
+}
+
+# Query Docker Hub for the latest patch version of a major.minor series
+# Returns "18.11.4" or empty string if no tags found
+latest_patch_for() {
+    local major_minor="$1"
+    local repo="gitlab-ce"
+    [ "$EDITION" = "ee" ] && repo="gitlab-ee"
+
+    local url="${DOCKER_HUB_API}/${repo}/tags?name=${major_minor}."
+    local tags
+    tags=$(curl -sfL --max-time 10 "$url") || return 1
+
+    echo "$tags" | python3 -c "
+import json, sys, re
+data = json.load(sys.stdin)
+if data.get('results'):
+    name = data['results'][0]['name']
+    m = re.match(r'(\d+\.\d+\.\d+)', name)
+    if m: print(m.group(1))
+" 2>/dev/null || true
+}
+
+# Get the latest released version for a given major version from Docker Hub
+# Returns the highest major.minor.patch available
+latest_for_major() {
+    local major="$1"
+    local repo="gitlab-ce"
+    [ "$EDITION" = "ee" ] && repo="gitlab-ee"
+
+    # Get all tags starting with this major version
+    local url="${DOCKER_HUB_API}/${repo}/tags?name=${major}."&page_size=100
+    local tags
+    tags=$(curl -sfL --max-time 15 "$url") || return 1
+
+    echo "$tags" | python3 -c "
+import json, sys, re
+data = json.load(sys.stdin)
+best = None
+for t in data.get('results', []):
+    m = re.match(r'(\d+\.\d+\.\d+)', t['name'])
+    if m:
+        v = tuple(int(x) for x in m.group(1).split('.'))
+        if best is None or v > best:
+            best = v
+if best:
+    print(f'{best[0]}.{best[1]}.{best[2]}')
+" 2>/dev/null || true
+}
+
+# Build the automatic upgrade path from the current version
+build_automatic_path() {
+    local current="$1"
+    local current_major current_minor
+    current_major=$(echo "$current" | cut -d. -f1)
+    current_minor=$(echo "$current" | cut -d. -f2)
+
+    local stops
+    stops=$(fetch_upgrade_stops) || die "Cannot build automatic path: failed to fetch upgrade data"
+
+    local path=()
+    local found_current=false
+    local last_resolved_major="$current_major"
+    local last_resolved_minor="$current_minor"
+
+    # Resolve each required stop >= current version
+    while IFS= read -r stop; do
+        local s_major s_minor
+        s_major=$(echo "$stop" | cut -d. -f1)
+        s_minor=$(echo "$stop" | cut -d. -f2)
+
+        # Skip stops before current version
+        if [ "$s_major" -lt "$current_major" ] 2>/dev/null || \
+           { [ "$s_major" -eq "$current_major" ] && [ "$s_minor" -lt "$current_minor" ] 2>/dev/null; }; then
+            continue
+        fi
+
+        found_current=true
+
+        # Resolve to latest patch version
+        local resolved
+        resolved=$(latest_patch_for "$stop") || resolved=""
+
+        if [ -n "$resolved" ]; then
+            path+=("$resolved")
+            last_resolved_major="$s_major"
+            last_resolved_minor="$s_minor"
+        fi
+    done <<< "$stops"
+
+    if [ "$found_current" = false ]; then
+        die "Current version ${current} is newer than any known upgrade stop. Already up to date?"
     fi
-    log_ok "Current version confirmed: ${RUNNING_VERSION}"
+
+    # Check for intermediate releases after the last resolved stop
+    # (e.g., 19.0.1 exists between 18.11 stop and 19.2 stop)
+    local check_major=$((last_resolved_major + 1))
+    local intermediate
+    intermediate=$(latest_for_major "$check_major") || intermediate=""
+    if [ -n "$intermediate" ]; then
+        # Verify this intermediate is not already covered by a resolved stop
+        local int_major int_minor
+        int_major=$(echo "$intermediate" | cut -d. -f1)
+        int_minor=$(echo "$intermediate" | cut -d. -f2)
+        # Only add if it's a different minor than what we already have
+        local already_have=false
+        for v in "${path[@]}"; do
+            local vm=$(echo "$v" | cut -d. -f1)
+            local vn=$(echo "$v" | cut -d. -f2)
+            if [ "$vm" = "$int_major" ] && [ "$vn" = "$int_minor" ]; then
+                already_have=true
+                break
+            fi
+        done
+        if [ "$already_have" = false ]; then
+            path+=("$intermediate")
+        fi
+    fi
+
+    if [ "${#path[@]}" -eq 0 ]; then
+        die "No upgrade path found from ${current}. May already be on the latest version."
+    fi
+
+    # If the current version's major.minor matches the first path element,
+    # replace it with the current version (we're already on that minor)
+    local first="${path[0]}"
+    local first_major first_minor
+    first_major=$(echo "$first" | cut -d. -f1)
+    first_minor=$(echo "$first" | cut -d. -f2)
+    if [ "$first_major" = "$current_major" ] && [ "$first_minor" = "$current_minor" ]; then
+        path[0]="$current"
+        # If current == latest patch and there's only one element, we're done
+        if [ "$current" = "$first" ] && [ "${#path[@]}" -le 1 ]; then
+            die "Already on the latest version (${current}). Nothing to upgrade."
+        fi
+        # If current == latest patch, skip this element (nothing to upgrade for this minor)
+        if [ "$current" = "$first" ]; then
+            path=("${path[@]:1}")
+        fi
+    fi
+
+    if [ "${#path[@]}" -eq 0 ]; then
+        die "Already on the latest version (${current}). Nothing to upgrade."
+    fi
+
+    echo "${path[*]}"
+}
+
+# ── Argument parsing ─────────────────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+Usage:
+  gitlab-upgrade.sh --community --path "18.11.2 => 18.11.4 => 19.0.1"
+  gitlab-upgrade.sh --enterprise --path "18.11.2 => 18.11.4 => 19.0.1"
+  gitlab-upgrade.sh --community --automatic
+  gitlab-upgrade.sh --community --automatic --yes
+
+Options:
+  --community        GitLab Community Edition (ce)
+  --enterprise       GitLab Enterprise Edition (ee)
+  --path "A => B => C"  Upgrade path (current => intermediates => target)
+  --automatic        Auto-detect upgrade path from GitLab + Docker Hub
+  --yes              Skip confirmation prompts (use with --automatic)
+  --container-name N     Container name (default: gitlab)
+  --compose-file F       Compose file (default: compose.yaml)
+EOF
+    exit 1
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --community)
+            [ -n "$EDITION" ] && die "Cannot specify both --community and --enterprise"
+            EDITION="ce"
+            shift
+            ;;
+        --enterprise)
+            [ -n "$EDITION" ] && die "Cannot specify both --community and --enterprise"
+            EDITION="ee"
+            shift
+            ;;
+        --path)
+            [ $# -lt 2 ] && die "--path requires an argument"
+            UPGRADE_PATH="$2"
+            shift 2
+            ;;
+        --automatic)
+            AUTOMATIC=true
+            shift
+            ;;
+        --yes|-y)
+            ASSUME_YES=true
+            shift
+            ;;
+        --container-name)
+            [ $# -lt 2 ] && die "--container-name requires an argument"
+            CONTAINER_NAME="$2"
+            shift 2
+            ;;
+        --compose-file)
+            [ $# -lt 2 ] && die "--compose-file requires an argument"
+            COMPOSE_FILE="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
+# ── Validate required arguments ──────────────────────────────────────────────
+[ -z "$EDITION" ] && die "Must specify --community or --enterprise"
+[ "$AUTOMATIC" = false ] && [ -z "$UPGRADE_PATH" ] && die "Must specify --path or --automatic"
+[ "$AUTOMATIC" = true ] && [ -n "$UPGRADE_PATH" ] && die "Cannot specify both --path and --automatic"
+
+# ── Resolve the upgrade path ─────────────────────────────────────────────────
+if [ "$AUTOMATIC" = true ]; then
+    log_step "Detecting current GitLab version..."
+
+    # We need the running version before we can build the path
+    # Validate compose.yaml exists first (needed by get_current_version method 3)
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        if [ -f "docker-compose.yaml" ]; then
+            COMPOSE_FILE="docker-compose.yaml"
+            log_warn "compose.yaml not found, using docker-compose.yaml"
+        elif [ -f "docker-compose.yml" ]; then
+            COMPOSE_FILE="docker-compose.yml"
+            log_warn "compose.yaml not found, using docker-compose.yml"
+        else
+            die "No compose file found (tried compose.yaml, docker-compose.yaml, docker-compose.yml)"
+        fi
+    fi
+
+    RUNNING_VERSION=$(get_current_version) || true
+    if [ -z "$RUNNING_VERSION" ]; then
+        die "Cannot auto-detect running version. Specify --path manually."
+    fi
+    log_ok "Detected running version: ${RUNNING_VERSION}"
+
+    log_step "Building upgrade path from ${RUNNING_VERSION}..."
+    AUTO_PATH=$(build_automatic_path "$RUNNING_VERSION") || {
+        log_warn "Automatic path detection failed. Specify --path manually."
+        exit 1
+    }
+
+    # Format as "current => step1 => step2 => ..."
+    UPGRADE_PATH="${RUNNING_VERSION} => ${AUTO_PATH// / => }"
+
+    log_info "Resolved upgrade path: ${UPGRADE_PATH}"
+    echo ""
+
+    # Confirm with user (unless --yes)
+    if [ "$ASSUME_YES" = false ]; then
+        echo -n "Proceed with this upgrade path? [y/N] "
+        read -r confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted by user"
+        log_ok "Confirmed"
+        echo ""
+    fi
+
+    CURRENT_VERSION="$RUNNING_VERSION"
+    # Parse the auto-resolved path (space-separated) into array
+    IFS=' ' read -r -a TARGET_VERSIONS <<< "$AUTO_PATH"
 else
-    log_warn "Could not auto-detect running version. Proceeding with user-provided version: ${CURRENT_VERSION}"
-    log_warn "If the version is wrong, the upgrade may fail."
+    # ── Validate compose.yaml exists ─────────────────────────────────────────
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        # Also check docker-compose.yaml as a fallback
+        if [ -f "docker-compose.yaml" ]; then
+            COMPOSE_FILE="docker-compose.yaml"
+            log_warn "compose.yaml not found, using docker-compose.yaml"
+        elif [ -f "docker-compose.yml" ]; then
+            COMPOSE_FILE="docker-compose.yml"
+            log_warn "compose.yaml not found, using docker-compose.yml"
+        else
+            die "No compose file found (tried compose.yaml, docker-compose.yaml, docker-compose.yml)"
+        fi
+    fi
+
+    # ── Parse the upgrade path ───────────────────────────────────────────────
+    # Split on " => " separator, trim whitespace, collect into array
+    versions=()
+    remaining="$UPGRADE_PATH"
+    while [[ "$remaining" =~ ^[[:space:]]*([^[:space:]]+) ]]; do
+        versions+=("${BASH_REMATCH[1]}")
+        remaining="${remaining#*${BASH_REMATCH[1]}}"
+        # Remove " => " separator if present
+        remaining="${remaining#*=>}"
+    done
+
+    [ "${#versions[@]}" -lt 2 ] && die "Upgrade path must contain at least two versions (current => target)"
+
+    CURRENT_VERSION="${versions[0]}"
+    TARGET_VERSIONS=("${versions[@]:1}")
+fi
+
+log_info "Edition:          GitLab ${EDITION^^}"
+log_info "Container name:   ${CONTAINER_NAME}"
+log_info "Compose file:     ${COMPOSE_FILE}"
+log_info "Current version:  ${CURRENT_VERSION}"
+log_info "Upgrade path:     ${CURRENT_VERSION} => $(IFS=' => '; echo "${TARGET_VERSIONS[*]}")"
+echo ""
+
+# ── Validate current version (skip if --automatic already confirmed) ─────────
+if [ "$AUTOMATIC" = false ]; then
+    log_step "Validating current GitLab version..."
+
+    RUNNING_VERSION=$(get_current_version) || true
+
+    if [ -n "$RUNNING_VERSION" ]; then
+        if [ "$RUNNING_VERSION" != "$CURRENT_VERSION" ]; then
+            die "Version mismatch: expected ${CURRENT_VERSION} but running ${RUNNING_VERSION}"
+        fi
+        log_ok "Current version confirmed: ${RUNNING_VERSION}"
+    else
+        log_warn "Could not auto-detect running version. Proceeding with user-provided version: ${CURRENT_VERSION}"
+        log_warn "If the version is wrong, the upgrade may fail."
+    fi
 fi
 
 # ── Extract major version ────────────────────────────────────────────────────
