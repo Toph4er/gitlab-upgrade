@@ -209,7 +209,7 @@ get_current_version() {
 fetch_upgrade_stops() {
     local yaml
     yaml=$(curl -sfL --max-time 15 "$UPGRADE_API_URL") || {
-        log_warn "Failed to fetch upgrade_path.yml from GitLab API"
+        log_warn "Failed to fetch upgrade_path.yml from GitLab API" >&2
         return 1
     }
 
@@ -249,7 +249,7 @@ latest_for_major() {
     [ "$EDITION" = "ee" ] && repo="gitlab-ee"
 
     # Get all tags starting with this major version
-    local url="${DOCKER_HUB_API}/${repo}/tags?name=${major}."&page_size=100
+    local url="${DOCKER_HUB_API}/${repo}/tags?name=${major}.&page_size=100"
     local tags
     tags=$(curl -sfL --max-time 15 "$url") || return 1
 
