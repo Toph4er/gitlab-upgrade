@@ -14,6 +14,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+GRAY='\033[0;90m'
 NC='\033[0m' # No Color
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
@@ -23,6 +24,7 @@ CONTAINER_NAME="gitlab"
 COMPOSE_FILE="compose.yaml"
 AUTOMATIC=false     # auto-detect upgrade path from GitLab + Docker Hub
 ASSUME_YES=false    # skip confirmation prompts
+DEBUG=false         # verbose diagnostics (URLs, HTTP status, per-stop resolution)
 HEALTH_CHECK_INTERVAL=5         # seconds between health polls
 HEALTH_CHECK_TIMEOUT=600        # max seconds to wait for healthy (10 min)
 MIGRATION_CHECK_INTERVAL=10     # seconds between migration status polls
@@ -39,6 +41,9 @@ log_step()  { echo -e "${CYAN}[STEP]${NC}  $*"; }
 log_ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 
 die() { log_error "$@"; exit 1; }
+
+# Print a debug line to stderr, but only when --debug is set.
+dbg() { [ "$DEBUG" = "true" ] || return 0; echo -e "${GRAY}[DEBUG]${NC} $*" >&2; }
 
 # Check if background migrations are still running.
 # Returns 0 if all done, 1 if migrations remain, 2 if check failed.
@@ -204,14 +209,54 @@ get_current_version() {
 # Fetches the canonical upgrade_path.yml from GitLab's repo and resolves each
 # major.minor stop to the latest available Docker image tag.
 
+# http_get LABEL URL
+# Fetches URL, writes the response body to stdout.
+# On failure, logs the reason (curl error / HTTP status) and returns non-zero.
+# Transient failures (network errors, non-2xx) are retried up to 3 times.
+http_get() {
+    local label="$1" url="$2"
+    local tmp http_code rc=0 detail attempt=1
+    local max_attempts=3
+    while [ $attempt -le $max_attempts ]; do
+        rc=0
+        tmp=$(mktemp) || return 1
+        http_code=$(curl -sSL --max-time 15 -o "$tmp" -w '%{http_code}' "$url" 2>"${tmp}.err") || rc=$?
+        if [ $rc -eq 0 ] && [ "${http_code:0:1}" = "2" ]; then
+            dbg "GET ${url} -> HTTP ${http_code}, $(wc -c < "$tmp") bytes (attempt ${attempt})"
+            cat "$tmp"
+            rm -f "$tmp" "${tmp}.err"
+            return 0
+        fi
+        if [ $rc -ne 0 ]; then
+            local curl_err
+            curl_err=$(head -c 200 "${tmp}.err" 2>/dev/null | tail -1)
+            detail="curl exit ${rc}${curl_err:+ — ${curl_err}}"
+        else
+            local snippet
+            snippet=$(head -c 200 "$tmp" 2>/dev/null | tr -d '\n')
+            detail="HTTP ${http_code}${snippet:+ — ${snippet}}"
+        fi
+        rm -f "$tmp" "${tmp}.err"
+        if [ $attempt -lt $max_attempts ]; then
+            log_warn "Fetch of ${label} failed (${detail}); retrying in 3s (attempt ${attempt}/${max_attempts})" >&2
+            sleep 3
+            attempt=$((attempt + 1))
+            continue
+        fi
+        log_warn "Failed to fetch ${label}: ${detail}" >&2
+        dbg "URL: ${url}"
+        if [ $rc -ne 0 ]; then
+            return $rc
+        fi
+        return 1
+    done
+}
+
 # Fetch and parse upgrade_path.yml from GitLab API
 # Outputs lines like "18.11" "19.2" etc.
 fetch_upgrade_stops() {
     local yaml
-    yaml=$(curl -sfL --max-time 15 "$UPGRADE_API_URL") || {
-        log_warn "Failed to fetch upgrade_path.yml from GitLab API" >&2
-        return 1
-    }
+    yaml=$(http_get "upgrade_path.yml (gitlab.com API)" "$UPGRADE_API_URL") || return 1
 
     # Parse YAML: extract major.minor pairs
     echo "$yaml" | awk '
@@ -229,7 +274,7 @@ latest_patch_for() {
 
     local url="${DOCKER_HUB_API}/${repo}/tags?name=${major_minor}."
     local tags
-    tags=$(curl -sfL --max-time 10 "$url") || return 1
+    tags=$(http_get "Docker Hub tags (name=${major_minor}.)" "$url") || return 1
 
     echo "$tags" | python3 -c "
 import json, sys, re
@@ -251,7 +296,7 @@ latest_for_major() {
     # Get all tags starting with this major version
     local url="${DOCKER_HUB_API}/${repo}/tags?name=${major}.&page_size=100"
     local tags
-    tags=$(curl -sfL --max-time 15 "$url") || return 1
+    tags=$(http_get "Docker Hub tags (name=${major}.)" "$url") || return 1
 
     echo "$tags" | python3 -c "
 import json, sys, re
@@ -275,8 +320,10 @@ build_automatic_path() {
     current_major=$(echo "$current" | cut -d. -f1)
     current_minor=$(echo "$current" | cut -d. -f2)
 
+    dbg "Current: ${current} (major=${current_major}, minor=${current_minor})"
     local stops
     stops=$(fetch_upgrade_stops) || die "Cannot build automatic path: failed to fetch upgrade data"
+    dbg "Required upgrade stops: $(echo "$stops" | tr '\n' ' ')"
 
     local path=()
     local found_current=false
@@ -300,6 +347,7 @@ build_automatic_path() {
         # Resolve to latest patch version
         local resolved
         resolved=$(latest_patch_for "$stop") || resolved=""
+        dbg "  stop ${stop} -> ${resolved:-(no published image)}"
 
         if [ -n "$resolved" ]; then
             path+=("$resolved")
@@ -317,6 +365,7 @@ build_automatic_path() {
     local check_major=$((last_resolved_major + 1))
     local intermediate
     intermediate=$(latest_for_major "$check_major") || intermediate=""
+    dbg "  intermediate check (major ${check_major}) -> ${intermediate:-none}"
     if [ -n "$intermediate" ]; then
         # Verify this intermediate is not already covered by a resolved stop
         local int_major int_minor
@@ -363,6 +412,7 @@ build_automatic_path() {
         die "Already on the latest version (${current}). Nothing to upgrade."
     fi
 
+    dbg "Resolved path: ${path[*]}"
     echo "${path[*]}"
 }
 
@@ -374,6 +424,7 @@ Usage:
   gitlab-upgrade.sh --enterprise --path "18.11.2 => 18.11.4 => 19.0.1"
   gitlab-upgrade.sh --community --automatic
   gitlab-upgrade.sh --community --automatic --yes
+  gitlab-upgrade.sh --community --automatic --debug
 
 Options:
   --community        GitLab Community Edition (ce)
@@ -381,6 +432,7 @@ Options:
   --path "A => B => C"  Upgrade path (current => intermediates => target)
   --automatic        Auto-detect upgrade path from GitLab + Docker Hub
   --yes              Skip confirmation prompts (use with --automatic)
+  --debug            Verbose diagnostics: URLs, HTTP status, per-stop resolution
   --container-name N     Container name (default: gitlab)
   --compose-file F       Compose file (default: compose.yaml)
 EOF
@@ -406,6 +458,10 @@ while [ $# -gt 0 ]; do
             ;;
         --automatic)
             AUTOMATIC=true
+            shift
+            ;;
+        --debug)
+            DEBUG=true
             shift
             ;;
         --yes|-y)
