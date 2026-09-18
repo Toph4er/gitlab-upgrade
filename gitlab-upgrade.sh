@@ -313,7 +313,9 @@ if best:
 " 2>/dev/null || true
 }
 
-# Build the automatic upgrade path from the current version
+# Build the automatic upgrade path from the current version.
+# Exit codes: 0 = path built (printed), 3 = up to date (nothing published
+# at or above current), 1 = error.
 build_automatic_path() {
     local current="$1"
     local current_major current_minor
@@ -357,37 +359,46 @@ build_automatic_path() {
     done <<< "$stops"
 
     if [ "$found_current" = false ]; then
-        die "Current version ${current} is newer than any known upgrade stop. Already up to date?"
+        dbg "Current is newer than any known upgrade stop — treating as up to date"
+        return 3
     fi
 
-    # Check for intermediate releases after the last resolved stop
-    # (e.g., 19.0.1 exists between 18.11 stop and 19.2 stop)
-    local check_major=$((last_resolved_major + 1))
-    local intermediate
-    intermediate=$(latest_for_major "$check_major") || intermediate=""
-    dbg "  intermediate check (major ${check_major}) -> ${intermediate:-none}"
-    if [ -n "$intermediate" ]; then
-        # Verify this intermediate is not already covered by a resolved stop
-        local int_major int_minor
-        int_major=$(echo "$intermediate" | cut -d. -f1)
-        int_minor=$(echo "$intermediate" | cut -d. -f2)
-        # Only add if it's a different minor than what we already have
+    # Check for published releases after the last resolved stop that aren't
+    # stops themselves (e.g., 19.4 is newer than the 19.2 stop; 19.0.1 sits
+    # between the 18.11 stop and the 19.2 stop). Check both the last-resolved
+    # major (newer minors) and the next major (first release of a new series).
+    local candidate c_major c_minor
+    for check_major in "$last_resolved_major" "$((last_resolved_major + 1))"; do
+        candidate=$(latest_for_major "$check_major") || candidate=""
+        dbg "  post-stop check (major ${check_major}) -> ${candidate:-none}"
+        [ -z "$candidate" ] && continue
+        c_major=$(echo "$candidate" | cut -d. -f1)
+        c_minor=$(echo "$candidate" | cut -d. -f2)
+        # Only add if strictly newer than the last resolved stop
+        if [ "$c_major" -lt "$last_resolved_major" ] || \
+           { [ "$c_major" -eq "$last_resolved_major" ] && [ "$c_minor" -lt "$last_resolved_minor" ]; }; then
+            continue
+        fi
+        # Skip if already in the path
         local already_have=false
         for v in "${path[@]}"; do
             local vm=$(echo "$v" | cut -d. -f1)
             local vn=$(echo "$v" | cut -d. -f2)
-            if [ "$vm" = "$int_major" ] && [ "$vn" = "$int_minor" ]; then
+            if [ "$vm" = "$c_major" ] && [ "$vn" = "$c_minor" ]; then
                 already_have=true
                 break
             fi
         done
         if [ "$already_have" = false ]; then
-            path+=("$intermediate")
+            path+=("$candidate")
         fi
-    fi
+    done
 
     if [ "${#path[@]}" -eq 0 ]; then
-        die "No upgrade path found from ${current}. May already be on the latest version."
+        # Stops >= current exist but none has a published image yet:
+        # we're on the latest reachable release. Not an error.
+        dbg "No published image at or above ${current} — up to date"
+        return 3
     fi
 
     # If the current version's major.minor matches the first path element,
@@ -400,7 +411,7 @@ build_automatic_path() {
         path[0]="$current"
         # If current == latest patch and there's only one element, we're done
         if [ "$current" = "$first" ] && [ "${#path[@]}" -le 1 ]; then
-            die "Already on the latest version (${current}). Nothing to upgrade."
+            return 3
         fi
         # If current == latest patch, skip this element (nothing to upgrade for this minor)
         if [ "$current" = "$first" ]; then
@@ -409,7 +420,7 @@ build_automatic_path() {
     fi
 
     if [ "${#path[@]}" -eq 0 ]; then
-        die "Already on the latest version (${current}). Nothing to upgrade."
+        return 3
     fi
 
     dbg "Resolved path: ${path[*]}"
@@ -517,10 +528,17 @@ if [ "$AUTOMATIC" = true ]; then
     log_ok "Detected running version: ${RUNNING_VERSION}"
 
     log_step "Building upgrade path from ${RUNNING_VERSION}..."
-    AUTO_PATH=$(build_automatic_path "$RUNNING_VERSION") || {
+    build_rc=0
+    AUTO_PATH=$(build_automatic_path "$RUNNING_VERSION") || build_rc=$?
+    if [ $build_rc -eq 3 ]; then
+        log_ok "You're on ${RUNNING_VERSION} — the latest reachable GitLab ${EDITION^^} release."
+        log_ok "Nothing to upgrade; a newer stop will appear here once it's published."
+        exit 0
+    fi
+    if [ $build_rc -ne 0 ]; then
         log_warn "Automatic path detection failed. Specify --path manually."
         exit 1
-    }
+    fi
 
     # Format as "current => step1 => step2 => ..."
     UPGRADE_PATH="${RUNNING_VERSION} => ${AUTO_PATH// / => }"
