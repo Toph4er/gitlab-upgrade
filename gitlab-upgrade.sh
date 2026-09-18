@@ -25,6 +25,7 @@ COMPOSE_FILE="compose.yaml"
 AUTOMATIC=false     # auto-detect upgrade path from GitLab + Docker Hub
 ASSUME_YES=false    # skip confirmation prompts
 DEBUG=false         # verbose diagnostics (URLs, HTTP status, per-stop resolution)
+CHECK=false         # check for updates only (implies --automatic); exit 0/10
 HEALTH_CHECK_INTERVAL=5         # seconds between health polls
 HEALTH_CHECK_TIMEOUT=600        # max seconds to wait for healthy (10 min)
 MIGRATION_CHECK_INTERVAL=10     # seconds between migration status polls
@@ -436,6 +437,7 @@ Usage:
   gitlab-upgrade.sh --community --automatic
   gitlab-upgrade.sh --community --automatic --yes
   gitlab-upgrade.sh --community --automatic --debug
+  gitlab-upgrade.sh --community --check        # report only, never modifies
 
 Options:
   --community        GitLab Community Edition (ce)
@@ -444,6 +446,9 @@ Options:
   --automatic        Auto-detect upgrade path from GitLab + Docker Hub
   --yes              Skip confirmation prompts (use with --automatic)
   --debug            Verbose diagnostics: URLs, HTTP status, per-stop resolution
+  --check            Check for updates only (implies --automatic). Never
+                     modifies anything. Exit codes: 0 = up to date,
+                     10 = update available, 1 = error
   --container-name N     Container name (default: gitlab)
   --compose-file F       Compose file (default: compose.yaml)
 EOF
@@ -475,6 +480,10 @@ while [ $# -gt 0 ]; do
             DEBUG=true
             shift
             ;;
+        --check)
+            CHECK=true
+            shift
+            ;;
         --yes|-y)
             ASSUME_YES=true
             shift
@@ -497,6 +506,12 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# --check implies automatic detection and excludes --path
+if [ "$CHECK" = true ]; then
+    [ -n "$UPGRADE_PATH" ] && die "--check cannot be combined with --path"
+    AUTOMATIC=true
+fi
 
 # ── Validate required arguments ──────────────────────────────────────────────
 [ -z "$EDITION" ] && die "Must specify --community or --enterprise"
@@ -542,6 +557,13 @@ if [ "$AUTOMATIC" = true ]; then
 
     # Format as "current => step1 => step2 => ..."
     UPGRADE_PATH="${RUNNING_VERSION} => ${AUTO_PATH// / => }"
+
+    # Check-only mode: report and stop without modifying anything
+    if [ "$CHECK" = true ]; then
+        log_ok "Update available: ${UPGRADE_PATH}"
+        log_info "Run without --check to perform this upgrade."
+        exit 10
+    fi
 
     log_info "Resolved upgrade path: ${UPGRADE_PATH}"
     echo ""
