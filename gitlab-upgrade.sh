@@ -402,21 +402,24 @@ build_automatic_path() {
         return 3
     fi
 
-    # If the current version's major.minor matches the first path element,
-    # replace it with the current version (we're already on that minor)
+    # The first path element may share major.minor with the current version
+    # (the stop for our own minor series). Compare patch versions numerically:
+    #   resolved >  current -> a newer patch in our minor IS the update; keep it
+    #   resolved <= current -> we're at or past that stop: drop it, and if it was
+    #                          the whole path we're on the latest reachable release
     local first="${path[0]}"
-    local first_major first_minor
+    local first_major first_minor first_patch current_patch
     first_major=$(echo "$first" | cut -d. -f1)
     first_minor=$(echo "$first" | cut -d. -f2)
+    first_patch=$(echo "$first" | cut -d. -f3)
+    current_patch=$(echo "$current" | cut -d. -f3)
     if [ "$first_major" = "$current_major" ] && [ "$first_minor" = "$current_minor" ]; then
-        path[0]="$current"
-        # If current == latest patch and there's only one element, we're done
-        if [ "$current" = "$first" ] && [ "${#path[@]}" -le 1 ]; then
-            return 3
-        fi
-        # If current == latest patch, skip this element (nothing to upgrade for this minor)
-        if [ "$current" = "$first" ]; then
-            path=("${path[@]:1}")
+        if [ "$first_patch" -le "$current_patch" ] 2>/dev/null; then
+            if [ "${#path[@]}" -eq 1 ]; then
+                dbg "On the latest published patch of ${current_major}.${current_minor} — up to date"
+                return 3
+            fi
+            path=("${path[@]:1}")   # we're at/past this stop; continue past it
         fi
     fi
 
