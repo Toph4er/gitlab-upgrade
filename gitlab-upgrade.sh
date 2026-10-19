@@ -564,7 +564,7 @@ if [ "$AUTOMATIC" = true ]; then
     # Check-only mode: report and stop without modifying anything
     if [ "$CHECK" = true ]; then
         log_ok "Update available: ${UPGRADE_PATH}"
-        log_info "Run without --check to perform this upgrade."
+        log_info "Re-run with --automatic (recommended) or --path to perform this upgrade."
         exit 10
     fi
 

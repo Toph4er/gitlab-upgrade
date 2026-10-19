@@ -72,7 +72,7 @@ Example — update available:
 
 ```
 [OK]    Update available: 18.11.0 => 19.2.6 => 19.4.0
-[INFO]  Run without --check to perform this upgrade.
+[INFO]  Re-run with --automatic (recommended) or --path to perform this upgrade.
 exit=10
 ```
 
