@@ -619,7 +619,7 @@ log_info "Edition:          GitLab ${EDITION^^}"
 log_info "Container name:   ${CONTAINER_NAME}"
 log_info "Compose file:     ${COMPOSE_FILE}"
 log_info "Current version:  ${CURRENT_VERSION}"
-log_info "Upgrade path:     ${CURRENT_VERSION} => $(IFS=' => '; echo "${TARGET_VERSIONS[*]}")"
+log_info "Upgrade path:     ${CURRENT_VERSION}$(printf ' => %s' "${TARGET_VERSIONS[@]}")"
 echo ""
 
 # ── Validate current version (skip if --automatic already confirmed) ─────────
